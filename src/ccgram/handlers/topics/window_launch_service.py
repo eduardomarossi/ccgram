@@ -4,9 +4,8 @@ Extracts the launch sequence from directory_callbacks._create_window_and_bind
 into a self-contained service module.  Callers build a ``WindowLaunchRequest``
 and call ``launch_window``; the result is a ``WindowLaunchResult``.
 
-CRITICAL ordering invariant (MC-2967):
-  create_window() → register_pending_creation(window_id)
-  must have NO await between them.  See the inline comment for full context.
+Creation is protected by a transaction guard until the durable target is
+registered. This keeps the SessionMonitor from adopting it before binding.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from ...session import session_manager
 from ...session_map import session_map_sync
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
-from ...multiplexer.window_ops import send_to_window
+from ..telegram_origin import send_telegram_to_window
 from ...user_preferences import user_preferences
 from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from ..messaging_pipeline.message_sender import safe_edit, safe_send
@@ -63,6 +62,7 @@ class WindowLaunchRequest:
     cwd: str
     mode: str
     pending_text: str | None
+    chat_id: int | None = None
     # Worktree metadata is NOT carried in this request. It flows through
     # context.user_data via PENDING_WORKTREE_PATH / PENDING_WORKTREE_BRANCH /
     # PENDING_WORKTREE_REPO keys, read directly by _persist_worktree_state and
@@ -146,17 +146,45 @@ async def _create_topic_window(
     wt_branch = ud.get(PENDING_WORKTREE_BRANCH) if ud else None
     wt_path = ud.get(PENDING_WORKTREE_PATH) if ud else None
     if tmux_manager.capabilities.native_worktrees and wt_repo and wt_branch and wt_path:
-        return await tmux_manager.create_worktree_window(
+        # The native worktree API cannot pin a preselected workspace.  Creating
+        # into an implicit workspace would violate the user's selection.
+        if chosen_workspace_id:
+            return (
+                False,
+                "Selected workspace cannot create a native worktree",
+                "",
+                "",
+            )
+        success, message, name, window_id = await tmux_manager.create_worktree_window(
             wt_repo,
             wt_path,
             wt_branch,
             window_name=Path(wt_path).name,
             launch_command=launch_command,
         )
-    return await tmux_manager.create_window(
-        selected_path,
-        launch_command=launch_command,
-        workspace_id=chosen_workspace_id,
+        return success, message, name, window_id
+    # Tmux preserves its long-standing creation behavior. Herdr's native
+    # agent-status capability selects the guarded-session creation transaction.
+    if tmux_manager.capabilities.native_agent_status is not True:
+        success, message, name, window_id = await tmux_manager.create_window(
+            selected_path,
+            launch_command=launch_command,
+            workspace_id=chosen_workspace_id,
+        )
+        return success, message, name, window_id
+    try:
+        target = await tmux_manager.create_topic_target(
+            selected_path,
+            launch_command=launch_command,
+            workspace_id=chosen_workspace_id,
+        )
+    except RuntimeError as exc:
+        return False, str(exc), "", ""
+    return (
+        True,
+        f"Created topic target '{target.label}'",
+        target.label,
+        target.target_id,
     )
 
 
@@ -207,7 +235,7 @@ async def _accept_yolo_confirmation(window_id: str, *, timeout: float = 8.0) -> 
 # ── main entry point ──────────────────────────────────────────────────────────
 
 
-async def launch_window(  # noqa: PLR0915, C901
+async def launch_window(  # noqa: PLR0912, PLR0915, C901
     query: CallbackQuery,
     context: ContextTypes.DEFAULT_TYPE,
     request: WindowLaunchRequest,
@@ -217,11 +245,10 @@ async def launch_window(  # noqa: PLR0915, C901
     Shared by _handle_mode_select (after mode picker) and _handle_provider_select
     (when mode picker is skipped for providers without YOLO flags).
 
-    CRITICAL (MC-2967): ``create_window`` → ``register_pending_creation(wid)``
-    must have NO await between them.  The provider's SessionStart hook fires
-    inside the new pane within seconds; the SessionMonitor's 1 s poll cycle would
-    otherwise see an unbound window and auto-create a duplicate Telegram topic
-    before ``bind_thread`` runs below.
+    CRITICAL (MC-2967): creation starts inside a global transaction guard,
+    then its durable target is registered before the transaction releases. This
+    prevents the SessionMonitor from auto-creating a topic while Herdr publishes
+    a session identity or before ``bind_thread`` runs below.
     """
     # Lazy: providers package heavy bootstrap
     from ccgram.providers import resolve_launch_command
@@ -238,19 +265,24 @@ async def launch_window(  # noqa: PLR0915, C901
         context.user_data.get(PENDING_WORKSPACE_ID) if context.user_data else None
     ) or None
 
-    success, message, created_wname, created_wid = await _create_topic_window(
-        selected_path, launch_command, chosen_workspace_id, context
-    )
+    with topic_orchestration.pending_creation_transaction():
+        (
+            success,
+            message,
+            created_wname,
+            created_wid,
+        ) = await _create_topic_window(
+            selected_path,
+            launch_command,
+            chosen_workspace_id,
+            context,
+        )
+        if success:
+            topic_orchestration.register_pending_creation(created_wid)
+
     if not success:
         await _abort_topic_creation(query, message, context)
         return WindowLaunchResult(success=False, error_message=message)
-
-    # Race-guard: tag this window as "directory flow in progress" BEFORE any
-    # subsequent await. The provider's SessionStart hook fires inside the new
-    # tmux pane within seconds; the SessionMonitor's 1s poll cycle would
-    # otherwise see an unbound window and auto-create a duplicate Telegram
-    # topic before bind_thread() runs below. See MC-2967 for full repro.
-    topic_orchestration.register_pending_creation(created_wid)
 
     user_preferences.update_user_mru(user_id, selected_path)
     session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
@@ -268,37 +300,84 @@ async def launch_window(  # noqa: PLR0915, C901
         user_id,
         pending_thread_id,
     )
-    await tmux_manager.stamp_pane_title(created_wid, provider_name)
+    try:
+        await tmux_manager.stamp_pane_title(created_wid, provider_name)
+    except BaseException:
+        # The target exists but launch wiring did not finish. Best-effort close
+        # it before propagating cancellation/errors; if close fails, retain the
+        # pending guard so the monitor cannot adopt it as an orphan.
+        if await tmux_manager.kill_window(created_wid):
+            topic_orchestration.clear_pending_creation(created_wid)
+            if pending_thread_id is not None:
+                thread_router.unbind_thread(user_id, pending_thread_id)
+        raise
 
+    query_message = query.message
+    chat = query_message.chat if query_message else None
     provider_caps = provider_registry.get(provider_name).capabilities
     if provider_caps.chat_first_command_path:
         # Lazy: shell ↔ topics cycle via window_callbacks adoption flow.
         from ..shell.shell_prompt_orchestrator import ensure_setup
 
-        await _wait_for_shell_ready(created_wid)
-        await ensure_setup(created_wid, "auto")
+        try:
+            await _wait_for_shell_ready(created_wid)
+            await ensure_setup(created_wid, "auto")
+        except BaseException:
+            if await tmux_manager.kill_window(created_wid):
+                topic_orchestration.clear_pending_creation(created_wid)
+                if pending_thread_id is not None:
+                    thread_router.unbind_thread(user_id, pending_thread_id)
+            raise
 
     if pending_thread_id is not None:
         thread_router.bind_thread(
-            user_id, pending_thread_id, created_wid, window_name=created_wname
+            user_id,
+            pending_thread_id,
+            created_wid,
+            window_name=created_wname,
+            chat_id=chat.id if chat and chat.type in ("group", "supergroup") else None,
         )
-        query_message = query.message
-        chat = query_message.chat if query_message else None
         if chat and chat.type in ("group", "supergroup"):
             thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
-        # Bind is durable now — handle_new_window's `_is_window_already_bound`
-        # check will find the binding, so the pending-creation race-guard can
-        # be released. (Late SessionMonitor polls are still safe: they will
-        # take the already-bound branch instead.)
-        topic_orchestration.clear_pending_creation(created_wid)
 
     provider = provider_registry.get(provider_name)
-    if approval_mode == "yolo" and provider.capabilities.has_yolo_confirmation:
-        await _accept_yolo_confirmation(created_wid)
+    try:
+        if approval_mode == "yolo" and provider.capabilities.has_yolo_confirmation:
+            await _accept_yolo_confirmation(created_wid)
 
-    if provider.capabilities.supports_hook:
-        await session_map_sync.wait_for_session_map_entry(created_wid)
+        map_entry_found = (
+            await session_map_sync.wait_for_session_map_entry(created_wid)
+            if provider.capabilities.supports_hook
+            else True
+        )
+    except BaseException:
+        if await tmux_manager.kill_window(created_wid):
+            topic_orchestration.clear_pending_creation(created_wid)
+            if pending_thread_id is not None:
+                thread_router.unbind_thread(user_id, pending_thread_id)
+        raise
 
+    if not map_entry_found:
+        # Do not release the guard or binding unless the target is actually
+        # gone. A late hook could otherwise adopt a still-live target into
+        # an orphan topic. Herdr's neutral close only affects its guarded
+        # target pane, never a sibling session in the shared tab.
+        if await tmux_manager.kill_window(created_wid):
+            topic_orchestration.clear_pending_creation(created_wid)
+            if pending_thread_id is not None:
+                thread_router.unbind_thread(user_id, pending_thread_id)
+            message = "Session did not register with ccgram in time"
+        else:
+            message = (
+                "Session did not register with ccgram in time and cleanup "
+                "failed; the topic remains quarantined for safe recovery"
+            )
+        await _abort_topic_creation(query, message, context)
+        return WindowLaunchResult(success=False, error_message=message)
+
+    # The target either has a hook record or never needed one. This also clears
+    # the no-thread path, which otherwise has no topic bind to release the guard.
+    topic_orchestration.clear_pending_creation(created_wid)
     if pending_thread_id is None:
         await safe_edit(query, f"✅ {message}")
         return WindowLaunchResult(success=True, window_id=created_wid)
@@ -343,9 +422,16 @@ async def launch_window(  # noqa: PLR0915, C901
                 pending_thread_id,
                 created_wid,
                 pending_text,
+                chat_id=chat.id if chat else None,
             )
         else:
-            send_ok, send_msg = await send_to_window(created_wid, pending_text)
+            send_ok, send_msg = await send_telegram_to_window(
+                user_id,
+                created_wid,
+                pending_thread_id,
+                pending_text,
+                chat.id if chat else None,
+            )
             if not send_ok:
                 logger.warning(
                     "Failed to forward pending text to window %s (user %s): %s",
