@@ -1,0 +1,18 @@
+[Unit]
+Description=CCGram — Control AI Coding Agents from Telegram
+Documentation=https://github.com/alexei-led/ccgram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eduardo
+WorkingDirectory=/home/eduardo/ccgram
+ExecStart=/home/eduardo/ccgram/venv/bin/ccgram run
+Restart=always
+RestartSec=5
+Environment=HOME=/home/eduardo
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
