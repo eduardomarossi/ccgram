@@ -328,7 +328,10 @@ async def _create_resume_window(
         cwd, agent_args=launch_args, launch_command=launch_command
     )
     if success:
-        if provider.capabilities.supports_hook:
+        if (
+            provider.capabilities.supports_hook
+            and provider.capabilities.wait_for_session_map_on_launch is True
+        ):
             await session_map_sync.wait_for_session_map_entry(created_wid)
         session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
         session_manager.set_window_provider(created_wid, provider.capabilities.name)

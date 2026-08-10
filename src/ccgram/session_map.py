@@ -416,7 +416,7 @@ class SessionMapSync:
         atomic_write_json(config.session_map_file, session_map)
 
     async def wait_for_session_map_entry(
-        self, window_id: str, timeout: float = 5.0, interval: float = 0.5
+        self, window_id: str, timeout: float = 45.0, interval: float = 0.5
     ) -> bool:
         """Poll session_map.json until an entry for window_id appears.
 

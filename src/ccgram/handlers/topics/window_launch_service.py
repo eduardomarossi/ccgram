@@ -347,7 +347,10 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
 
         map_entry_found = (
             await session_map_sync.wait_for_session_map_entry(created_wid)
-            if provider.capabilities.supports_hook
+            if (
+                provider.capabilities.supports_hook
+                and provider.capabilities.wait_for_session_map_on_launch is True
+            )
             else True
         )
     except BaseException:

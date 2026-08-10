@@ -591,6 +591,9 @@ class CodexProvider(JsonlProvider):
         name="codex",
         launch_command="codex",
         supports_hook=True,
+        # Codex defines the first prompt as the practical session start, so
+        # SessionStart cannot register the window before that prompt is sent.
+        wait_for_session_map_on_launch=False,
         hook_install_managed_by_ccgram=True,
         supports_resume=True,
         supports_continue=True,

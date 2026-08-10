@@ -73,6 +73,12 @@ class TestHookAwareCapabilities:
         assert caps.supports_resume is True
         assert caps.supports_continue is True
 
+    def test_only_codex_defers_session_registration(
+        self, hook_aware_jsonl_provider
+    ) -> None:
+        caps = hook_aware_jsonl_provider.capabilities
+        assert caps.wait_for_session_map_on_launch is (caps.name != "codex")
+
     def test_invalid_resume_id_raises(self, hook_aware_jsonl_provider) -> None:
         with pytest.raises(ValueError, match="Invalid resume_id"):
             hook_aware_jsonl_provider.make_launch_args(resume_id="abc; rm -rf /")

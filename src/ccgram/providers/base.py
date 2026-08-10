@@ -122,6 +122,10 @@ class ProviderCapabilities:
     name: str  # e.g. "claude", "codex", "gemini"
     launch_command: str  # e.g. "claude", "codex"
     supports_hook: bool = False
+    # Some CLIs defer SessionStart until the first prompt. Those providers
+    # still support hooks, but launch flows must not wait for session_map
+    # before forwarding that prompt or both sides deadlock.
+    wait_for_session_map_on_launch: bool = True
     hook_install_managed_by_ccgram: bool = False
     supports_resume: bool = False
     supports_resume_picker: bool = False

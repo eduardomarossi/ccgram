@@ -184,7 +184,7 @@ class TestLaunchWindowSuccess:
             patch(
                 "ccgram.handlers.topics.window_launch_service.provider_registry"
             ) as mock_reg,
-            patch("ccgram.providers.resolve_launch_command", return_value="claude"),
+            patch("ccgram.providers.resolve_launch_command", return_value="codex"),
         ):
             mock_mux.create_topic_target = AsyncMock(
                 return_value=TopicTargetResult("@5", "my-win", "@5")
@@ -203,7 +203,8 @@ class TestLaunchWindowSuccess:
             caps = MagicMock()
             caps.chat_first_command_path = False
             caps.has_yolo_confirmation = False
-            caps.supports_hook = False
+            caps.supports_hook = True
+            caps.wait_for_session_map_on_launch = False
             mock_reg.get.return_value.capabilities = caps
 
             await launch_window(
@@ -212,7 +213,7 @@ class TestLaunchWindowSuccess:
                 WindowLaunchRequest(
                     user_id=100,
                     thread_id=42,
-                    provider_name="claude",
+                    provider_name="codex",
                     cwd=str(tmp_path),
                     mode="normal",
                     pending_text=None,
@@ -224,6 +225,7 @@ class TestLaunchWindowSuccess:
         mock_orch.pending_creation_transaction.assert_called_once_with()
         mock_orch.register_pending_creation.assert_called_once_with("@5")
         mock_orch.clear_pending_creation.assert_called_once_with("@5")
+        mock_sms.wait_for_session_map_entry.assert_not_awaited()
         mock_edit.assert_awaited_once()
         assert "✅" in mock_edit.call_args[0][1]
 
@@ -327,6 +329,7 @@ class TestLaunchWindowSuccess:
                 chat_first_command_path=False,
                 has_yolo_confirmation=False,
                 supports_hook=True,
+                wait_for_session_map_on_launch=True,
             )
             mock_reg.get.return_value.capabilities = caps
 
@@ -383,6 +386,7 @@ class TestLaunchWindowSuccess:
                 chat_first_command_path=False,
                 has_yolo_confirmation=False,
                 supports_hook=True,
+                wait_for_session_map_on_launch=True,
             )
 
             result = await launch_window(
