@@ -13,6 +13,7 @@ from ccgram.handlers.messaging_pipeline.message_queue import (
     _dispatch,
     _handle_content_task,
     _merge_content_tasks,
+    _process_content_task,
     get_or_create_queue,
     shutdown_workers,
 )
@@ -315,6 +316,34 @@ class TestDispatch:
         mock_clear.assert_awaited_once_with(bot, 1, cl)
 
 
+class TestChatScopedContentDelivery:
+    async def test_content_task_uses_explicit_chat_id(self) -> None:
+        client = FakeTelegramClient()
+        task = ContentTask(
+            window_id="@0",
+            parts=("hello",),
+            thread_id=42,
+            chat_id=-1002,
+        )
+
+        with (
+            patch(
+                "ccgram.handlers.messaging_pipeline.message_queue.convert_status_to_content",
+                new_callable=AsyncMock,
+            ) as mock_convert,
+            patch(
+                "ccgram.handlers.messaging_pipeline.message_queue.rate_limit_send_message",
+                new_callable=AsyncMock,
+                return_value=None,
+            ) as mock_send,
+        ):
+            await _process_content_task(client, 100, task)
+
+        mock_convert.assert_not_awaited()
+        mock_send.assert_awaited_once()
+        assert mock_send.await_args_list[0].args[:2] == (client, -1002)
+
+
 class TestNoBackEdgeImports:
     def _get_imports(self, filepath: Path) -> set[str]:
         tree = ast.parse(filepath.read_text())
@@ -418,6 +447,56 @@ class TestMessageQueueWorker:
 
         assert worker.done()
         assert not worker.exception() if not worker.cancelled() else True
+
+
+class TestThinkingGate:
+    @patch(
+        "ccgram.handlers.messaging_pipeline.message_queue._process_content_task",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "ccgram.handlers.messaging_pipeline.message_queue.flush_if_active",
+        new_callable=AsyncMock,
+    )
+    async def test_hidden_suppresses_thinking(
+        self, mock_flush, mock_process, bot, queue, lock
+    ):
+        ct = _content_task("private reasoning", content_type="thinking")
+        with patch(
+            "ccgram.handlers.messaging_pipeline.message_queue.config.hide_thinking",
+            True,
+        ):
+            extra = await _handle_content_task(bot, 1, ct, queue, lock)
+
+        assert extra == 0
+        mock_flush.assert_not_awaited()
+        mock_process.assert_not_awaited()
+
+    @patch(
+        "ccgram.handlers.messaging_pipeline.message_queue._process_content_task",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "ccgram.handlers.messaging_pipeline.message_queue.flush_if_active",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "ccgram.handlers.messaging_pipeline.message_queue.is_batch_eligible",
+        return_value=False,
+    )
+    async def test_shown_processes_thinking(
+        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+    ):
+        ct = _content_task("public reasoning", content_type="thinking")
+        with patch(
+            "ccgram.handlers.messaging_pipeline.message_queue.config.hide_thinking",
+            False,
+        ):
+            extra = await _handle_content_task(bot, 1, ct, queue, lock)
+
+        assert extra == 0
+        mock_flush.assert_awaited_once_with(bot, 1, ct)
+        mock_process.assert_awaited_once_with(bot, 1, ct)
 
 
 class TestToolCallsGate:

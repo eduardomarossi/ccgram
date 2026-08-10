@@ -1,12 +1,4 @@
-"""Polling coordinator for terminal status monitoring.
-
-Orchestrates the background polling cycle: iterates thread bindings,
-delegates per-window work to window_tick, and runs periodic/lifecycle tasks.
-
-Key components:
-  - _tick_bound_windows: Per-iteration helper (injectable runtime for tests)
-  - status_poll_loop: Background polling task (entry point for bot.py)
-"""
+"""Polling coordinator for terminal status monitoring."""
 
 import asyncio
 from typing import TYPE_CHECKING
@@ -14,8 +6,9 @@ from typing import TYPE_CHECKING
 import structlog
 from telegram.error import TelegramError
 
-from ...thread_router import thread_router
+from ...thread_router import chat_scope, thread_router
 from ...multiplexer import multiplexer as tmux_manager
+from ...multiplexer.reconciliation import list_windows_for_reconciliation
 from ...utils import log_throttled
 from . import window_tick
 from .polling_runtime import PollingRuntime
@@ -33,8 +26,6 @@ _BACKOFF_MIN = 2.0
 _BACKOFF_MAX = 30.0
 
 _LoopError = (TelegramError, OSError, RuntimeError, ValueError)
-
-
 # ── Per-iteration tick helper ─────────────────────────────────────────────
 
 
@@ -49,14 +40,20 @@ async def _tick_bound_windows(
     Extracted so tests can drive a single iteration with an isolated
     ``PollingRuntime``. Production callers pass no runtime; default singletons.
     """
-    for user_id, thread_id, wid in list(thread_router.iter_thread_bindings()):
+    bindings = list(thread_router.iter_thread_bindings_with_chat()) or [
+        (uid, None, tid, wid) for uid, tid, wid in thread_router.iter_thread_bindings()
+    ]
+    for user_id, chat_id, thread_id, wid in bindings:
+        if chat_id is None:
+            chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(window_id=wid)
         try:
-            w = window_lookup.get(wid)
-            await window_tick.tick_window(
-                bot, user_id, thread_id, wid, w, runtime=runtime
-            )
+            with chat_scope(chat_id):
+                w = window_lookup.get(wid)
+                await window_tick.tick_window(
+                    bot, user_id, thread_id, wid, w, runtime=runtime
+                )
         except (TelegramError, OSError) as e:
             log_throttled(
                 logger,
@@ -73,10 +70,7 @@ async def _tick_bound_windows(
 
 async def status_poll_loop(bot: "Bot") -> None:
     """Background task to poll terminal status for all thread-bound windows."""
-    # Lazy: status_poll_loop is launched once during bootstrap; keep the
-    # config + telegram_client imports tied to the call site so the
-    # polling package's cold path does not pull PTB.
-    # Lazy: config singleton resolved at call time
+    # Lazy: imports keep PTB out of the polling package's cold path.
     from ...config import config as _cfg
 
     # Lazy: PTBTelegramClient wraps the live PTB bot — resolved per-tick
@@ -96,7 +90,11 @@ async def status_poll_loop(bot: "Bot") -> None:
     _error_streak = 0
     while True:
         try:
-            all_windows = await tmux_manager.list_windows()
+            all_windows = await list_windows_for_reconciliation(tmux_manager)
+            if all_windows is None:
+                logger.warning("Status poll skipped: window listing unavailable")
+                await asyncio.sleep(poll_interval)
+                continue
             window_lookup = {w.window_id: w for w in all_windows}
 
             await run_periodic_tasks(client, all_windows, timers)

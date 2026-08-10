@@ -24,6 +24,12 @@ ccgram -v                     # Run with debug logging
 
 ## Getting Started
 
+### Platform Support
+
+CCGram supports Linux, macOS, and WSL2. Native Windows is not supported.
+
+On Windows, install and run CCGram inside WSL2. Install the multiplexer and agent CLI inside the WSL distribution.
+
 ### BotFather Setup
 
 You need a Telegram bot token to run CCGram. Create one via [@BotFather](https://t.me/BotFather).
@@ -65,6 +71,14 @@ Run `ccgram doctor` at any time to validate your setup:
 ccgram doctor         # Check configuration, hooks, multiplexer, agent CLIs
 ccgram doctor --fix   # Auto-fix common issues (install hooks, kill orphans, etc.)
 ```
+
+## Herdr guarded-session migration
+
+Herdr topics use `agent.list` as their sole identity source. CCGram stores only an opaque `herdr-session-v1-…` target; tabs, panes, terminal IDs, names, directories, and focus are live locators, not topic identity. Each action takes a fresh snapshot and fails closed when its target is missing, duplicate, malformed, or sessionless.
+
+Existing Herdr tab/pane bindings are marked `legacy_herdr` and blocked. Use `/unbind` to archive the CCGram binding without closing the Herdr session; rollback can restore that record but it remains blocked. Send a message in the topic and explicitly choose a listed session target to rebind. CCGram never guesses a migration target.
+
+A session can change after the fresh guard and before Herdr receives an action. CCGram records that post-guard dispatch race and does not claim atomic delivery. Run live Herdr tests only against a disposable server and redact target/session evidence.
 
 ## Local Dev in tmux
 
@@ -177,6 +191,7 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_LIVE_VIEW_TIMEOUT` / `--live-view-timeout`   | `300`                          | Live view auto-stop timeout in seconds (min 1)                                                       |
 | `CCGRAM_STATUS_MODE` / `--status-mode`               | `system`                       | Topic emoji color scheme: `system` (green=working) or `user` (green=ready)                           |
 | `CCGRAM_HIDE_TOOL_CALLS` / `--hide-tool-calls`       | `false`                        | Set `true` to globally hide `tool_use`/`tool_result` messages (per-window override via `/toolcalls`) |
+| `CCGRAM_HIDE_THINKING` / `--hide-thinking`           | `false`                        | Set `true` to globally hide thinking messages                                                        |
 | `CCGRAM_PROMPT_MODE` / `--prompt-mode`               | `wrap`                         | Shell prompt marker: `wrap` (append `⌘N⌘`) or `replace` (legacy `{prefix}:N❯`)                       |
 | `CCGRAM_PROMPT_MARKER`                               | `ccgram`                       | Marker prefix used only by `replace` mode                                                            |
 | `CCGRAM_PANE_LIFECYCLE_NOTIFY`                       | `false`                        | Default for per-window pane create/close notifications (toggle via `/panes`)                         |
@@ -212,6 +227,12 @@ By default, `tool_use` and `tool_result` events from Claude/Codex/Gemini are for
 - **Per-window**: `/toolcalls` in a topic cycles `default → shown → hidden`. The per-window setting always wins over the global default.
 
 Hook events (Stop, StopFailure, SubagentStart/Stop, TaskCompleted, TeammateIdle) are **never** suppressed — they bypass the gate so you still see what matters.
+
+## Thinking Visibility
+
+By default, thinking messages are forwarded to Telegram. Set `CCGRAM_HIDE_THINKING=true` or use `--hide-thinking` to hide them globally.
+
+This option does not hide responses, tool messages, or hook events. It has no per-window override.
 
 ## Voice Message Transcription
 
@@ -286,7 +307,7 @@ ccgram talks to the terminal multiplexer through a backend-neutral seam. tmux is
 1. **Install herdr** and make sure the `herdr` binary is in `PATH`. Start its server so the control socket exists.
 2. **Select the backend:** set `CCGRAM_MULTIPLEXER=herdr` (env var or `.env`). The default is `tmux`.
 3. **Socket path (optional):** ccgram reads `$HERDR_SOCKET_PATH` to find the server. Leave it unset to use herdr's default socket; set it to target a specific server.
-4. **Install the ccgram hook as usual:** `ccgram hook --install`. The same Claude Code hook works on both backends — it resolves which window fired from `$HERDR_PANE_ID` (tmux uses `$TMUX_PANE`), so no herdr-specific hook step is required.
+4. **Install integrations and the ccgram hook:** for Pi, run `herdr integration install pi`, then start new Pi agents or restart existing ones so they load the integration and publish `agent_session`. Install the ccgram hook as usual with `ccgram hook --install`. The same Claude Code hook works on both backends — it resolves which window fired from `$HERDR_PANE_ID` (tmux uses `$TMUX_PANE`), so no herdr-specific hook step is required.
 5. **Verify:** `ccgram doctor`. When `CCGRAM_MULTIPLEXER=herdr`, doctor checks the `herdr` binary, socket reachability, the pinned protocol version, and that ccgram's and herdr's own Claude hooks coexist in `settings.json` (instead of the tmux checks).
 
 ```bash
@@ -297,7 +318,7 @@ CCGRAM_MULTIPLEXER=herdr
 
 ### Protocol version pinning
 
-ccgram accepts herdr socket protocols 14, 15, and 16 without warnings. On the first call it reads `herdr status`; an older, newer, missing, or otherwise unknown protocol emits a warning and ccgram continues in best-effort mode, so CLI-backed operations can still work after a herdr upgrade or downgrade. A stopped server, failed status command, or malformed status response still prevents startup. Run the live herdr contract suite before relying on an untested protocol.
+ccgram accepts herdr socket protocols 14, 15, 16, and 17 without warnings. On the first call it reads `herdr status`; an older, newer, missing, or otherwise unknown protocol emits a warning and ccgram continues in best-effort mode, so CLI-backed operations can still work after a herdr upgrade or downgrade. A stopped server, failed status command, or malformed status response still prevents startup. Run the live herdr contract suite before relying on an untested protocol.
 
 ### Differences from tmux
 
@@ -309,12 +330,12 @@ herdr advertises its own capabilities through the seam; the behavioral consequen
 | Foreground detection      | `ps -t <tty>`                   | `pane process-info` (no tty)                                               |
 | Scrollback capture        | unbounded                       | clamped to **1000 lines**; longer output is flagged as truncated           |
 | Agent status              | inferred from terminal scraping | native (herdr reports agent status directly)                               |
-| Window IDs across restart | stable                          | re-minted on a herdr **server** restart — ccgram re-resolves by session id |
+| Window IDs across restart | stable                          | guarded session target is revalidated from fresh `agent.list`; ccgram never re-resolves a tab/pane ID |
 | Topic labels              | window name                     | adaptive `"<workspace> ▸ <tab>"` (tab name is primary)                     |
 
 Creating sessions from the terminal on herdr is covered in [Creating Sessions from the Terminal](#creating-sessions-from-the-terminal).
 
-> **Workspace picker:** On herdr, `/new` shows an extra step after directory selection — a workspace picker that lets you pin the new tab inside an existing herdr workspace. If no workspaces exist yet (or none matches the selected directory), the picker is skipped and ccgram creates a new workspace automatically.
+> **Workspace picker:** On herdr, `/new` shows an extra step after directory selection. Choose a workspace to pin the new tab there, or skip it: ccgram then explicitly creates a workspace from the requested directory and uses only its returned ID. It never infers the active or a matching workspace.
 >
 > **Self-hosting escape hatch:** Workspaces or tabs whose label matches `__*__` (e.g. `__main__`) are invisible to ccgram. Use this naming convention to run ccgram itself inside herdr without it auto-adopting its own terminal as a topic.
 
@@ -409,7 +430,7 @@ When an agent session exits or crashes, the bot detects the dead window and offe
 - **Continue** — Resume the last conversation (all providers support this)
 - **Resume** — Browse and select a past session to resume from
 
-The buttons shown adapt to each provider's capabilities. Claude, Codex, Gemini, and Pi support Fresh, Continue, and Resume. Shell supports Fresh only (shell sessions are ephemeral).
+The buttons shown adapt to each provider's capabilities. Claude and Antigravity support Fresh, Continue, and the CCGram Resume picker. Codex, Gemini, and Pi support Fresh and Continue; their CLIs can resume known session IDs, but CCGram does not yet enumerate those providers' sessions. Shell supports Fresh only because shell sessions are ephemeral.
 
 ## Manual Provider Override (`/agent`)
 
@@ -489,7 +510,7 @@ Tunables: `CCGRAM_SEND_SEARCH_DEPTH` (default 5), `CCGRAM_SEND_MAX_RESULTS` (def
 
 ## Action Toolbar (`/toolbar`)
 
-`/toolbar` opens an inline keyboard of provider-specific tmux key actions. Row 1 is universal: `[📷 Screen, ⏹ Ctrl-C, 📺 Live]`. Row 2 varies per provider: Claude (Mode, Think, Esc), Codex (Esc, Tab, Mode), Gemini (Mode, YOLO, Esc), Pi (Esc, Tab, π Model), Shell (Enter, EOF, Suspend). Claude/Codex/Gemini/Pi add a navigation row (Up, Enter, Down). The final row is `[📄 Last, Get File, Close]`; Shell folds Esc in: `[📄 Last, Get File, Esc, Close]`.
+`/toolbar` opens an inline keyboard of provider-specific tmux key actions. Row 1 is universal: `[📷 Screen, ⏹ Ctrl-C, 📺 Live]`. Row 2 varies per provider: Antigravity (Esc, Tab, Model), Claude (Mode, Think, Esc), Codex (Esc, Tab, Mode), Gemini (Mode, YOLO, Esc), Pi (Esc, Tab, π Model), Shell (Enter, EOF, Suspend). Antigravity/Claude/Codex/Gemini/Pi add a navigation row (Up, Enter, Down). The final row is `[📄 Last, Get File, Close]`; Shell folds Esc in: `[📄 Last, Get File, Esc, Close]`.
 
 Toggle actions (Mode = Shift+Tab, Think = Tab, YOLO = Ctrl+Y) capture the pane ~250 ms after the key press and report the resulting mode-line in the toast (e.g., `auto-accept edits on`).
 
@@ -585,6 +606,11 @@ WantedBy=default.target
 systemctl --user enable ccgram
 systemctl --user start ccgram
 ```
+
+ccgram retries brief Telegram polling conflicts for up to 90 seconds, which can
+occur after a network reconnect. Persistent conflicts stop with a non-zero exit
+so `Restart=on-failure` restarts the service. Check for another bot process that
+uses the same token if the conflict returns.
 
 On macOS, you can use a launchd plist or simply run in a detached tmux session:
 

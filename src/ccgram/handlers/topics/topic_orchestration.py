@@ -12,7 +12,9 @@ Core responsibilities:
 from __future__ import annotations
 
 import asyncio
-import contextlib
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 import time
 from pathlib import Path
 
@@ -31,8 +33,8 @@ from ...session_monitor import NewWindowEvent
 from ...telegram_client import TelegramClient
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
-from ..messaging_pipeline.message_sender import is_thread_gone
 from ..status.topic_emoji import strip_emoji_prefix
+from .topic_probe import probe_topic_exists
 
 logger = structlog.get_logger()
 
@@ -46,6 +48,39 @@ _TOPIC_CREATE_RETRY_BUFFER_SECONDS = 1
 # longer outages are caught by the existing flood-control backoff.
 _TOPIC_CREATE_TRANSIENT_RETRIES = 1
 _TOPIC_CREATE_TRANSIENT_BACKOFF_S = 1.0
+
+
+# Serializes every auto-create/rebind attempt for one window. Session-monitor,
+# startup adoption, and /sync can otherwise create duplicate topics concurrently.
+@dataclass(slots=True)
+class _WindowTopicLock:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+_window_topic_locks: dict[str, _WindowTopicLock] = {}
+
+
+@asynccontextmanager
+async def _window_topic_lock(window_id: str):
+    state = _window_topic_locks.setdefault(
+        window_id, _WindowTopicLock(lock=asyncio.Lock())
+    )
+    state.users += 1
+    try:
+        await state.lock.acquire()
+    except BaseException:
+        state.users -= 1
+        if state.users == 0 and _window_topic_locks.get(window_id) is state:
+            _window_topic_locks.pop(window_id, None)
+        raise
+    try:
+        yield
+    finally:
+        state.lock.release()
+        state.users -= 1
+        if state.users == 0 and _window_topic_locks.get(window_id) is state:
+            _window_topic_locks.pop(window_id, None)
 
 
 async def _create_forum_topic_with_retry(
@@ -106,7 +141,19 @@ def _is_window_already_bound(window_id: str) -> bool:
 # 30s TTL is the safety net in case directory_callbacks crashes before
 # clearing the entry — handle_new_window will eventually reclaim the window.
 _pending_user_creations: dict[str, float] = {}
+_pending_creation_transactions: set[object] = set()
 _PENDING_CREATION_TTL_S = 30.0
+
+
+@contextmanager
+def pending_creation_transaction() -> Iterator[None]:
+    """Block auto-adoption until a new target has a durable ID."""
+    token = object()
+    _pending_creation_transactions.add(token)
+    try:
+        yield
+    finally:
+        _pending_creation_transactions.discard(token)
 
 
 def register_pending_creation(window_id: str) -> None:
@@ -132,6 +179,8 @@ def _is_pending_user_creation(window_id: str) -> bool:
     Expired entries are evicted lazily on read so a crashed directory flow
     can't permanently shadow a window from auto-topic-creation.
     """
+    if _pending_creation_transactions:
+        return True
     expires_at = _pending_user_creations.get(window_id)
     if expires_at is None:
         return False
@@ -207,30 +256,75 @@ def collect_target_chats(window_id: str) -> set[int]:
     return seen_chats
 
 
-def _bind_topic_to_user(
-    thread_id: int, window_id: str, chat_id: int, topic_name: str
-) -> None:
-    """Bind a newly created topic to a user in the given chat."""
-    for user_id, tid, _ in thread_router.iter_thread_bindings():
-        if thread_router.resolve_chat_id(user_id, tid) == chat_id:
-            thread_router.bind_thread(
-                user_id, thread_id, window_id, window_name=topic_name
-            )
-            thread_router.set_group_chat_id(user_id, thread_id, chat_id)
-            return
+def _chat_window_is_free(user_id: int, chat_id: int, window_id: str) -> bool:
+    bindings = getattr(thread_router, "chat_thread_bindings", None)
+    if isinstance(bindings, dict):
+        return (user_id, chat_id, window_id) not in {
+            (uid, bound_chat, bound_window)
+            for (uid, bound_chat, _thread), bound_window in bindings.items()
+        }
+    return True
 
-    if config.allowed_users:
-        first_user_id = next(iter(config.allowed_users))
-        thread_router.bind_thread(
-            first_user_id, thread_id, window_id, window_name=topic_name
+
+def _find_topic_owner(
+    chat_id: int, window_id: str, preferred_user_id: int | None = None
+) -> int | None:
+    """Find a user who can bind this window without evicting another topic."""
+    bindings = list(thread_router.iter_thread_bindings())
+    if preferred_user_id is not None:
+        return (
+            preferred_user_id
+            if _chat_window_is_free(preferred_user_id, chat_id, window_id)
+            else None
         )
-        thread_router.set_group_chat_id(first_user_id, thread_id, chat_id)
+
+    users_in_chat = {
+        user_id
+        for user_id, thread_id, _ in bindings
+        if thread_router.resolve_chat_id(user_id, thread_id) == chat_id
+    }
+    candidates = users_in_chat or set(config.allowed_users)
+    return next(
+        (
+            user_id
+            for user_id in sorted(candidates)
+            if _chat_window_is_free(user_id, chat_id, window_id)
+        ),
+        None,
+    )
+
+
+def _bind_topic_to_user(
+    user_id: int, thread_id: int, window_id: str, chat_id: int, topic_name: str
+) -> None:
+    """Bind a newly created topic to its preselected user."""
+    thread_router.bind_thread(
+        user_id,
+        thread_id,
+        window_id,
+        window_name=topic_name,
+        chat_id=chat_id,
+    )
+    thread_router.set_group_chat_id(user_id, thread_id, chat_id)
 
 
 async def create_topic_in_chat(
-    client: TelegramClient, chat_id: int, window_id: str, topic_name: str
-) -> None:
-    """Create a forum topic in one chat with backoff handling."""
+    client: TelegramClient,
+    chat_id: int,
+    window_id: str,
+    topic_name: str,
+    *,
+    user_id: int | None = None,
+) -> bool:
+    """Create and bind one forum topic, returning whether it succeeded."""
+    owner_id = _find_topic_owner(chat_id, window_id, user_id)
+    if owner_id is None:
+        logger.warning(
+            "Skipping topic creation for window %s in chat %d: no bindable user",
+            window_id,
+            chat_id,
+        )
+        return False
     retry_until = _topic_create_retry_until.get(chat_id, 0.0)
     now = time.monotonic()
     if now < retry_until:
@@ -242,7 +336,7 @@ async def create_topic_in_chat(
             window_id,
             wait_seconds,
         )
-        return
+        return False
 
     try:
         topic = await _create_forum_topic_with_retry(client, chat_id, topic_name)
@@ -254,7 +348,10 @@ async def create_topic_in_chat(
             chat_id,
             window_id,
         )
-        _bind_topic_to_user(topic.message_thread_id, window_id, chat_id, topic_name)
+        _bind_topic_to_user(
+            owner_id, topic.message_thread_id, window_id, chat_id, topic_name
+        )
+        return True
     except RetryAfter as e:
         retry_after_seconds = (
             e.retry_after
@@ -271,32 +368,14 @@ async def create_topic_in_chat(
             chat_id,
             retry_after_seconds,
         )
+        return False
     except TelegramError:
         logger.exception(
             "Failed to create topic for window %s in chat %d",
             window_id,
             chat_id,
         )
-
-
-async def _topic_exists(
-    client: TelegramClient, chat_id: int, thread_id: int
-) -> bool | None:
-    """Probe a Telegram topic. True=exists, False=gone, None=unknown."""
-    try:
-        msg = await client.send_message(
-            chat_id,
-            "​",
-            message_thread_id=thread_id,
-            disable_notification=True,
-        )
-    except TelegramError as exc:
-        if is_thread_gone(exc):
-            return False
-        return None
-    with contextlib.suppress(TelegramError):
-        await client.delete_message(chat_id, msg.message_id)
-    return True
+        return False
 
 
 async def _rebind_existing_topic_by_name(
@@ -329,7 +408,7 @@ async def _rebind_existing_topic_by_name(
         return False
 
     user_id, thread_id, old_window_id, chat_id = matches[0]
-    exists = await _topic_exists(client, chat_id, thread_id)
+    exists = await probe_topic_exists(client, chat_id, thread_id)
     if exists is False:
         thread_router.unbind_thread(user_id, thread_id)
         logger.info(
@@ -347,7 +426,11 @@ async def _rebind_existing_topic_by_name(
         return False
 
     thread_router.bind_thread(
-        user_id, thread_id, event.window_id, window_name=topic_name
+        user_id,
+        thread_id,
+        event.window_id,
+        window_name=topic_name,
+        chat_id=chat_id,
     )
     thread_router.set_group_chat_id(user_id, thread_id, chat_id)
     logger.info(
@@ -360,17 +443,36 @@ async def _rebind_existing_topic_by_name(
     return True
 
 
-async def handle_new_window(event: NewWindowEvent, client: TelegramClient) -> None:
-    """Create or bind a Telegram forum topic for a newly detected tmux window.
+async def handle_new_window(
+    event: NewWindowEvent,
+    client: TelegramClient,
+    *,
+    target_user_id: int | None = None,
+    target_chat_id: int | None = None,
+) -> bool:
+    """Ensure a new window has a topic, returning whether it is bound."""
+    async with _window_topic_lock(event.window_id):
+        return await _handle_new_window_locked(
+            event,
+            client,
+            target_user_id=target_user_id,
+            target_chat_id=target_chat_id,
+        )
 
-    Skips if the window is already bound. Reuses one stale same-name topic when
-    it still exists; otherwise creates one topic per unique group chat.
-    """
-    if _is_window_already_bound(event.window_id):
+
+async def _handle_new_window_locked(
+    event: NewWindowEvent,
+    client: TelegramClient,
+    *,
+    target_user_id: int | None = None,
+    target_chat_id: int | None = None,
+) -> bool:
+    """Create or bind a topic while holding the per-window creation lock."""
+    if target_user_id is None and _is_window_already_bound(event.window_id):
         logger.debug(
             "New window %s already bound, skipping topic creation", event.window_id
         )
-        return
+        return True
 
     if _is_pending_user_creation(event.window_id):
         logger.debug(
@@ -378,20 +480,35 @@ async def handle_new_window(event: NewWindowEvent, client: TelegramClient) -> No
             "skipping auto topic creation",
             event.window_id,
         )
-        return
+        return False
 
     await _auto_detect_provider(event.window_id)
 
     topic_name = event.window_name or Path(event.cwd).name or event.window_id
-    if await _rebind_existing_topic_by_name(event, client, topic_name):
-        return
+    if target_user_id is None and await _rebind_existing_topic_by_name(
+        event, client, topic_name
+    ):
+        return True
 
-    seen_chats = collect_target_chats(event.window_id)
+    seen_chats = (
+        {target_chat_id}
+        if target_chat_id is not None
+        else collect_target_chats(event.window_id)
+    )
     if not seen_chats:
-        return
+        return False
 
-    for chat_id in seen_chats:
-        await create_topic_in_chat(client, chat_id, event.window_id, topic_name)
+    results = [
+        await create_topic_in_chat(
+            client,
+            chat_id,
+            event.window_id,
+            topic_name,
+            user_id=target_user_id,
+        )
+        for chat_id in seen_chats
+    ]
+    return any(results)
 
 
 async def adopt_unbound_windows(client: TelegramClient) -> None:

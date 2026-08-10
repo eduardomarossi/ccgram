@@ -34,6 +34,7 @@ from ..thread_router import thread_router
 from ..window_state_ports import identity_state
 from .callback_data import CB_AGENT_CANCEL, CB_AGENT_SET
 from .callback_helpers import get_thread_id, user_owns_window
+from .callback_tokens import compact_callback_data, resolve_callback_data
 from .callback_registry import register
 from .messaging_pipeline.message_sender import safe_edit, safe_reply
 
@@ -46,6 +47,7 @@ _BUTTONS_PER_ROW = 3
 
 # Stable order — also defines what shows in the picker.
 _PROVIDERS: tuple[tuple[str, str], ...] = (
+    ("antigravity", "Antigravity"),
     ("claude", "Claude"),
     ("codex", "Codex"),
     ("gemini", "Gemini"),
@@ -63,7 +65,12 @@ def _resolve_window(update: Update) -> tuple[int, int, str] | None:
     thread_id = get_thread_id(update)
     if thread_id is None:
         return None
-    window_id = thread_router.get_window_for_thread(user.id, thread_id)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    window_id = (
+        thread_router.get_window_for_thread(user.id, thread_id, chat_id)
+        if isinstance(chat_id, int)
+        else thread_router.get_window_for_thread(user.id, thread_id)
+    )
     if not window_id:
         return None
     return user.id, thread_id, window_id
@@ -76,7 +83,10 @@ def _build_keyboard(window_id: str, current: str) -> InlineKeyboardMarkup:
         prefix = "✓ " if name == current else ""
         row.append(
             InlineKeyboardButton(
-                f"{prefix}{label}", callback_data=f"{CB_AGENT_SET}{window_id}:{name}"
+                f"{prefix}{label}",
+                callback_data=compact_callback_data(
+                    CB_AGENT_SET, f"{CB_AGENT_SET}{window_id}:{name}", window_id
+                ),
             )
         )
         if len(row) == _BUTTONS_PER_ROW:
@@ -87,10 +97,16 @@ def _build_keyboard(window_id: str, current: str) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(
-                "🔄 Auto", callback_data=f"{CB_AGENT_SET}{window_id}:auto"
+                "🔄 Auto",
+                callback_data=compact_callback_data(
+                    CB_AGENT_SET, f"{CB_AGENT_SET}{window_id}:auto", window_id
+                ),
             ),
             InlineKeyboardButton(
-                "Cancel", callback_data=f"{CB_AGENT_CANCEL}{window_id}"
+                "Cancel",
+                callback_data=compact_callback_data(
+                    CB_AGENT_CANCEL, f"{CB_AGENT_CANCEL}{window_id}", window_id
+                ),
             ),
         ]
     )
@@ -252,10 +268,16 @@ async def _dispatch(update: Update, _context: "ContextTypes.DEFAULT_TYPE") -> No
     query = update.callback_query
     if not query or not query.data:
         return
-    if query.data.startswith(CB_AGENT_CANCEL):
-        window_id = query.data[len(CB_AGENT_CANCEL) :]
-        user = update.effective_user
-        if user is None or not user_owns_window(user.id, window_id):
+    user = update.effective_user
+    if user is None:
+        return
+    data = resolve_callback_data(query.data, user.id, user_owns_window)
+    if data is None:
+        await query.answer("This button has expired", show_alert=True)
+        return
+    if data.startswith(CB_AGENT_CANCEL):
+        window_id = data[len(CB_AGENT_CANCEL) :]
+        if not user_owns_window(user.id, window_id):
             await query.answer("Not your window")
             return
         await _ack_and_strip(
@@ -263,13 +285,12 @@ async def _dispatch(update: Update, _context: "ContextTypes.DEFAULT_TYPE") -> No
             f"Cancelled. Agent still **{identity_state.get_provider_name(window_id) or '(unknown)'}**.",
         )
         return
-    payload = query.data[len(CB_AGENT_SET) :]
+    payload = data[len(CB_AGENT_SET) :]
     if ":" not in payload:
         await query.answer("Bad callback")
         return
     window_id, chosen = payload.rsplit(":", 1)
-    user = update.effective_user
-    if user is None or not user_owns_window(user.id, window_id):
+    if not user_owns_window(user.id, window_id):
         await query.answer("Not your window")
         return
     if chosen not in _VALID_NAMES:
